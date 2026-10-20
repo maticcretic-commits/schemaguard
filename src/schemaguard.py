@@ -20,17 +20,19 @@ outside the subset is reported as an UNSUPPORTED keyword warning —
 never silently treated as passing.
 
 Usage:
-    schemaguard validate <file-or-dir> --schema contract.json
-                        [--format text|json] [--strict]
+    schemaguard validate <file-or-dir|-> --schema contract.json
+                        [--format text|json|sarif] [--strict]
     schemaguard snapshot <outputs-dir> --out baseline.schema.json
-    schemaguard diff <old.schema.json> <new.schema.json> [--format text|json]
+    schemaguard diff <old.schema.json> <new.schema.json> [--format text|json|sarif]
     schemaguard init
 """
 
 import argparse
 import json
+import os
 import re
 import sys
+import tempfile
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
@@ -581,6 +583,108 @@ def load_schema_file(path):
 
 
 # ---------------------------------------------------------------------------
+# SARIF output (SARIF 2.1.0 — see CONVENTIONS.md)
+# ---------------------------------------------------------------------------
+
+def _sarif_rule_name(rule_id):
+    return "".join(p.capitalize() for p in re.split(
+        r"[^A-Za-z0-9]+", rule_id) if p) or "Finding"
+
+
+def build_sarif(results):
+    """Build a SARIF 2.1.0 log. `results` items: {rule_id, rule_text,
+    level, message, uri (optional), line (optional)}."""
+    rules, seen = [], set()
+    out = []
+    for r in results:
+        if r["rule_id"] not in seen:
+            seen.add(r["rule_id"])
+            rules.append({
+                "id": r["rule_id"],
+                "name": _sarif_rule_name(r["rule_id"]),
+                "shortDescription": {"text": r["rule_text"]},
+                "defaultConfiguration": {"level": r["level"]},
+            })
+        res = {"ruleId": r["rule_id"], "level": r["level"],
+               "message": {"text": r["message"]}}
+        if r.get("uri"):
+            loc = {"artifactLocation": {"uri": r["uri"]}}
+            if r.get("line"):
+                loc["region"] = {"startLine": r["line"]}
+            res["locations"] = [{"physicalLocation": loc}]
+        out.append(res)
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "schemaguard",
+                "version": VERSION,
+                "informationUri":
+                    "https://github.com/maticcretic-commits/schemaguard",
+                "rules": rules,
+            }},
+            "results": out,
+        }],
+    }
+
+
+def sarif_validate_results(report):
+    """Contract violations -> error results (tier HIGH); unsupported-
+    keyword warnings -> note results (tier INFO)."""
+    results = []
+    for r in report["results"]:
+        for e in r["errors"]:
+            results.append({
+                "rule_id": "contract-violation",
+                "rule_text": "Output violates the schema contract",
+                "level": "error",
+                "message": f"{e['path']}: {e['message']}",
+                "uri": r["source"],
+            })
+    for w in report["warnings"]:
+        results.append({
+            "rule_id": "unsupported-schema",
+            "rule_text": "Part of the schema could not be enforced",
+            "level": "note",
+            "message": w["message"],
+        })
+    return results
+
+
+def sarif_diff_results(changes, new_label):
+    """Breaking changes -> error results; compatible changes -> note."""
+    results = []
+    for c in changes:
+        results.append({
+            "rule_id": "breaking-change" if c["breaking"]
+                       else "schema-change",
+            "rule_text": "Breaking schema change" if c["breaking"]
+                         else "Backward-compatible schema change",
+            "level": "error" if c["breaking"] else "note",
+            "message": f"{c['path']}: [{c['change']}] {c['detail']}",
+            "uri": new_label,
+        })
+    return results
+
+
+def _materialize_stdin(text):
+    """Write stdin text to a temp file so path-based loaders can read
+    it. A single JSON document becomes .json; anything else is treated
+    as line-delimited .jsonl. Returns the temp path."""
+    try:
+        json.loads(text)
+        suffix = ".json"
+    except json.JSONDecodeError:
+        suffix = ".jsonl"
+    fd, name = tempfile.mkstemp(prefix="schemaguard-stdin-",
+                                suffix=suffix)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return name
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -594,6 +698,16 @@ def _caller_error(message, code):
 
 
 def cmd_validate(args):
+    stdin_tmp = None
+    if args.path == "-":
+        # Pipe composability (CONVENTIONS.md): outputs arrive on stdin
+        # (one JSON document, or JSONL). The schema stays a file —
+        # stdin can only be read once.
+        if args.schema == "-":
+            _caller_error("only one input may come from stdin",
+                          "invalid_args")
+        stdin_tmp = _materialize_stdin(sys.stdin.read())
+        args.path = stdin_tmp
     target = Path(args.path)
     if not target.exists():
         _caller_error(f"path not found: {args.path}", "file_not_found")
@@ -601,11 +715,18 @@ def cmd_validate(args):
     if err:
         _caller_error(err, "invalid_schema")
     report = run_validation(args.path, schema, strict=args.strict)
+    if stdin_tmp:
+        for r in report["results"]:
+            r["source"] = r["source"].replace(stdin_tmp, "<stdin>")
+        Path(stdin_tmp).unlink(missing_ok=True)
     if report["summary"]["total"] == 0:
         _caller_error(
             f"no .json/.jsonl outputs found under {args.path}",
             "no_outputs")
-    if args.format == "json":
+    if args.format == "sarif":
+        print(json.dumps(build_sarif(sarif_validate_results(report)),
+                         indent=2))
+    elif args.format == "json":
         error_count = sum(len(r["errors"]) for r in report["results"])
         highest = "HIGH" if report["summary"]["failed"] else (
             "INFO" if report["warnings"] else "NONE")
@@ -665,16 +786,37 @@ def cmd_snapshot(args):
     sys.exit(0)
 
 
+def _load_schema_arg(arg):
+    """Load a schema from a file path, or from stdin when arg is '-'
+    (pipe composability — at most one side may use stdin)."""
+    if arg == "-":
+        try:
+            data = json.loads(sys.stdin.read())
+        except json.JSONDecodeError as e:
+            return None, f"cannot parse schema from stdin: {e}"
+        if not isinstance(data, (dict, bool)):
+            return None, "schema from stdin must be a JSON object " \
+                         "(or true/false)"
+        return data, None
+    return load_schema_file(arg)
+
+
 def cmd_diff(args):
-    old, err = load_schema_file(args.old)
+    if args.old == "-" and args.new == "-":
+        _caller_error("only one side of a diff may come from stdin",
+                      "invalid_args")
+    old, err = _load_schema_arg(args.old)
     if err:
         _caller_error(err, "invalid_schema")
-    new, err = load_schema_file(args.new)
+    new, err = _load_schema_arg(args.new)
     if err:
         _caller_error(err, "invalid_schema")
     changes = diff_schemas(old, new)
     breaking = [c for c in changes if c["breaking"]]
-    if args.format == "json":
+    if args.format == "sarif":
+        print(json.dumps(build_sarif(
+            sarif_diff_results(changes, args.new)), indent=2))
+    elif args.format == "json":
         highest = "HIGH" if breaking else (
             "INFO" if changes else "NONE")
         print(json.dumps({"tool": "schemaguard", "version": VERSION,
@@ -800,9 +942,12 @@ def main():
 
     v = sub.add_parser("validate",
                        help="validate outputs against a schema contract")
-    v.add_argument("path", help="output file or directory of outputs")
+    v.add_argument("path", help="output file or directory of outputs "
+                                "('-' reads one JSON/JSONL stream "
+                                "from stdin)")
     v.add_argument("--schema", required=True, help="contract (JSON Schema)")
-    v.add_argument("--format", choices=("text", "json"), default="text")
+    v.add_argument("--format", choices=("text", "json", "sarif"),
+                   default="text")
     v.add_argument("--strict", action="store_true",
                    help="fail on fields the schema does not declare, "
                         "even without additionalProperties: false")
@@ -817,9 +962,11 @@ def main():
 
     d = sub.add_parser("diff",
                        help="diff two schemas; exit 1 on breaking changes")
-    d.add_argument("old", help="the old (baseline) schema")
+    d.add_argument("old", help="the old (baseline) schema "
+                               "('-' reads stdin; one side only)")
     d.add_argument("new", help="the new schema")
-    d.add_argument("--format", choices=("text", "json"), default="text")
+    d.add_argument("--format", choices=("text", "json", "sarif"),
+                   default="text")
     d.set_defaults(fn=cmd_diff)
 
     i = sub.add_parser("init",
