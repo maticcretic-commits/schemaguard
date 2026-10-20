@@ -1,0 +1,20 @@
+# AgentForge family dogfood: this repo verifies itself with the
+# shared reusable workflow (maticcretic-commits/.github) — SchemaGuard validates its bundled clean example output against the example contract.
+# Reports are uploaded as run artifacts; a FAIL verdict fails the job.
+
+name: verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: maticcretic-commits/.github/.github/workflows/agentforge-verify.yml@main
+    with:
+      tool: schemaguard
+      args: validate examples/outputs/clean.json --schema examples/contract.json --format json
+      sarif-args: validate examples/outputs/clean.json --schema examples/contract.json --format sarif
