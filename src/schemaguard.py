@@ -35,6 +35,8 @@ from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 
+VERSION = "1.0.0"
+
 TYPE_ORDER = ("null", "boolean", "integer", "number", "string",
               "array", "object")
 
@@ -582,22 +584,36 @@ def load_schema_file(path):
 # Commands
 # ---------------------------------------------------------------------------
 
+def _caller_error(message, code):
+    """Caller error (exit 2): the human line plus one JSON error-envelope
+    line, both to stderr (see CONVENTIONS.md)."""
+    print(f"error: {message}", file=sys.stderr)
+    print(json.dumps({"error": {"code": code, "message": message}}),
+          file=sys.stderr)
+    sys.exit(2)
+
+
 def cmd_validate(args):
     target = Path(args.path)
     if not target.exists():
-        print(f"error: path not found: {args.path}", file=sys.stderr)
-        sys.exit(2)
+        _caller_error(f"path not found: {args.path}", "file_not_found")
     schema, err = load_schema_file(args.schema)
     if err:
-        print(f"error: {err}", file=sys.stderr)
-        sys.exit(2)
+        _caller_error(err, "invalid_schema")
     report = run_validation(args.path, schema, strict=args.strict)
     if report["summary"]["total"] == 0:
-        print(f"error: no .json/.jsonl outputs found under {args.path}",
-              file=sys.stderr)
-        sys.exit(2)
+        _caller_error(
+            f"no .json/.jsonl outputs found under {args.path}",
+            "no_outputs")
     if args.format == "json":
-        out = {"schema": args.schema, **report}
+        error_count = sum(len(r["errors"]) for r in report["results"])
+        highest = "HIGH" if report["summary"]["failed"] else (
+            "INFO" if report["warnings"] else "NONE")
+        out = {"tool": "schemaguard", "version": VERSION,
+               "schema_version": 1,
+               "schema": args.schema, **report,
+               "findings_summary": {"count": error_count,
+                                    "highest_severity": highest}}
         print(json.dumps(out, indent=2))
     else:
         s = report["summary"]
@@ -629,15 +645,13 @@ def cmd_validate(args):
 def cmd_snapshot(args):
     target = Path(args.path)
     if not target.exists():
-        print(f"error: path not found: {args.path}", file=sys.stderr)
-        sys.exit(2)
+        _caller_error(f"path not found: {args.path}", "file_not_found")
     schema, stats, count, load_errors = snapshot_schema(args.path)
     for e in load_errors:
         print(f"warning: skipped {e}", file=sys.stderr)
     if schema is None:
-        print(f"error: no parseable outputs found under {args.path}",
-              file=sys.stderr)
-        sys.exit(2)
+        _caller_error(
+            f"no parseable outputs found under {args.path}", "no_outputs")
     out = Path(args.out)
     out.write_text(json.dumps(schema, indent=2) + "\n", encoding="utf-8")
     print(f"Snapshot: inferred a baseline schema from {count} sample(s) "
@@ -654,18 +668,23 @@ def cmd_snapshot(args):
 def cmd_diff(args):
     old, err = load_schema_file(args.old)
     if err:
-        print(f"error: {err}", file=sys.stderr)
-        sys.exit(2)
+        _caller_error(err, "invalid_schema")
     new, err = load_schema_file(args.new)
     if err:
-        print(f"error: {err}", file=sys.stderr)
-        sys.exit(2)
+        _caller_error(err, "invalid_schema")
     changes = diff_schemas(old, new)
     breaking = [c for c in changes if c["breaking"]]
     if args.format == "json":
-        print(json.dumps({"old": args.old, "new": args.new,
+        highest = "HIGH" if breaking else (
+            "INFO" if changes else "NONE")
+        print(json.dumps({"tool": "schemaguard", "version": VERSION,
+                          "schema_version": 1,
+                          "old": args.old, "new": args.new,
                           "breaking_count": len(breaking),
-                          "changes": changes}, indent=2))
+                          "changes": changes,
+                          "findings_summary": {
+                              "count": len(breaking),
+                              "highest_severity": highest}}, indent=2))
     else:
         print("=" * 68)
         print("SchemaGuard — schema diff")
@@ -772,6 +791,11 @@ def main():
         prog="schemaguard",
         description="Contract-check agent outputs against a JSON "
                     "Schema. Contracts are for agents too.")
+    ap.add_argument("--version", action="version",
+                    version=f"schemaguard {VERSION}")
+    ap.add_argument("--no-color", action="store_true",
+                    help="disable ANSI color output (accepted for "
+                         "family consistency; output is never colored)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     v = sub.add_parser("validate",
