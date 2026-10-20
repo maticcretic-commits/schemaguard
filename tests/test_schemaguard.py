@@ -619,6 +619,87 @@ def test_cli_diff_exit_codes(tmp_path):
     assert all("change" in c and "breaking" in c for c in out["changes"])
 
 
+# ---------------------------------------------------------------------------
+# Phase 1: version flag, JSON envelope, error envelope
+# ---------------------------------------------------------------------------
+
+def test_cli_version():
+    r = run_cli("--version")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "schemaguard 1.0.0"
+
+
+def test_cli_validate_json_envelope_on_failure(tmp_path):
+    schema = write(tmp_path / "contract.json", json.dumps(CONTRACT))
+    # Renamed field: missing required $.email + unexpected $.email_address
+    # = exactly 2 validation errors.
+    write(tmp_path / "o.json",
+          json.dumps({"id": 1, "email_address": "user@example.com"}))
+    r = run_cli("validate", str(tmp_path / "o.json"), "--schema",
+                str(schema), "--format", "json")
+    assert r.returncode == 1
+    out = json.loads(r.stdout)
+    assert out["tool"] == "schemaguard"
+    assert out["version"] == "1.0.0"
+    assert out["schema_version"] == 1
+    assert out["findings_summary"] == {"count": 2,
+                                       "highest_severity": "HIGH"}
+    # Existing payload keys are untouched.
+    assert out["schema"] == str(schema)
+    assert out["summary"]["failed"] == 1
+
+
+def test_cli_schema_version_is_exactly_int_1(tmp_path):
+    schema = write(tmp_path / "contract.json", json.dumps(CONTRACT))
+    write(tmp_path / "o.json",
+          json.dumps({"id": 1, "email": "user@example.com"}))
+    r = run_cli("validate", str(tmp_path / "o.json"), "--schema",
+                str(schema), "--format", "json")
+    assert r.returncode == 0
+    out = json.loads(r.stdout)
+    assert type(out["schema_version"]) is int
+    assert out["schema_version"] == 1
+
+
+def test_cli_diff_json_envelope_on_breaking_pair(tmp_path):
+    old = write(tmp_path / "old.json", json.dumps(OLD))
+    new = write(tmp_path / "new.json", json.dumps(NEW))
+    r = run_cli("diff", str(old), str(new), "--format", "json")
+    assert r.returncode == 1
+    out = json.loads(r.stdout)
+    assert out["tool"] == "schemaguard"
+    assert out["version"] == "1.0.0"
+    assert out["schema_version"] == 1
+    assert out["findings_summary"] == {
+        "count": out["breaking_count"], "highest_severity": "HIGH"}
+    assert out["breaking_count"] == 4
+
+
+def test_cli_snapshot_out_file_has_no_envelope_keys(tmp_path):
+    write(tmp_path / "samples" / "a.json",
+          json.dumps({"id": 1, "tags": ["x"]}))
+    out = tmp_path / "baseline.schema.json"
+    r = run_cli("snapshot", str(tmp_path / "samples"), "--out", str(out))
+    assert r.returncode == 0, r.stderr
+    schema = json.loads(out.read_text())
+    assert "tool" not in schema
+    assert "version" not in schema
+    assert "schema_version" not in schema
+    assert "findings_summary" not in schema
+
+
+def test_cli_missing_path_error_envelope(tmp_path):
+    schema = write(tmp_path / "contract.json", json.dumps(CONTRACT))
+    missing = str(tmp_path / "missing")
+    r = run_cli("validate", missing, "--schema", str(schema))
+    assert r.returncode == 2
+    lines = [ln for ln in r.stderr.splitlines() if ln.strip()]
+    assert lines[0] == f"error: path not found: {missing}"
+    envelope = json.loads(lines[-1])
+    assert envelope == {"error": {"code": "file_not_found",
+                                  "message": f"path not found: {missing}"}}
+
+
 def test_cli_init_scaffolds(tmp_path):
     r = run_cli("init", "--dir", str(tmp_path))
     assert r.returncode == 0
