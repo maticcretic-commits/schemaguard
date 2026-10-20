@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "schemaguard"
+version = "1.0.0"
+description = "Contract-check agent outputs against a JSON Schema. Contracts are for agents too."
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+[project.scripts]
+schemaguard = "schemaguard:main"
+
+[tool.setuptools]
+py-modules = ["schemaguard"]
+package-dir = {"" = "src"}
