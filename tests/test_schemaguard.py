@@ -713,3 +713,109 @@ def test_cli_init_scaffolds(tmp_path):
     # Second run without --force refuses to overwrite.
     r = run_cli("init", "--dir", str(tmp_path))
     assert "exists" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: SARIF output + stdin inputs
+# ---------------------------------------------------------------------------
+
+def assert_sarif_shape(doc, tool_name):
+    """SARIF 2.1.0 top-level required fields (structure assertion)."""
+    assert doc["version"] == "2.1.0"
+    assert doc["$schema"].endswith("sarif-2.1.0.json")
+    assert len(doc["runs"]) == 1
+    run = doc["runs"][0]
+    driver = run["tool"]["driver"]
+    assert driver["name"] == tool_name
+    assert driver["version"]
+    assert driver["informationUri"].startswith(
+        "https://github.com/maticcretic-commits/")
+    rule_ids = {r["id"] for r in driver["rules"]}
+    for res in run["results"]:
+        assert res["ruleId"] in rule_ids
+        assert res["level"] in ("error", "warning", "note", "none")
+        assert res["message"]["text"]
+    return run
+
+
+CONTRACT_P2 = {"type": "object", "required": ["id"],
+            "properties": {"id": {"type": "string"}}}
+
+
+def test_sarif_validate(tmp_path):
+    schema = tmp_path / "contract.json"
+    schema.write_text(json.dumps(CONTRACT_P2))
+    out = tmp_path / "o.json"
+    out.write_text(json.dumps({"id": 7}))
+    proc = run_cli("validate", str(out), "--schema", str(schema),
+                   "--format", "sarif")
+    assert proc.returncode == 1
+    doc = json.loads(proc.stdout)  # stdout is pure JSON in sarif mode
+    run = assert_sarif_shape(doc, "schemaguard")
+    errors = [r for r in run["results"] if r["level"] == "error"]
+    assert len(errors) == 1  # matches findings_summary count in json mode
+    assert errors[0]["ruleId"] == "contract-violation"
+    loc = errors[0]["locations"][0]["physicalLocation"]
+    assert loc["artifactLocation"]["uri"] == str(out)
+
+
+def test_sarif_validate_clean(tmp_path):
+    schema = tmp_path / "contract.json"
+    schema.write_text(json.dumps(CONTRACT_P2))
+    out = tmp_path / "o.json"
+    out.write_text(json.dumps({"id": "x"}))
+    proc = run_cli("validate", str(out), "--schema", str(schema),
+                   "--format", "sarif")
+    assert proc.returncode == 0
+    run = assert_sarif_shape(json.loads(proc.stdout), "schemaguard")
+    assert [r for r in run["results"] if r["level"] == "error"] == []
+
+
+def test_sarif_diff(tmp_path):
+    old = tmp_path / "old.json"
+    new = tmp_path / "new.json"
+    old.write_text(json.dumps({"type": "object",
+                               "properties": {"a": {"type": "string"}}}))
+    new.write_text(json.dumps({"type": "object", "properties": {}}))
+    proc = run_cli("diff", str(old), str(new), "--format", "sarif")
+    assert proc.returncode == 1
+    run = assert_sarif_shape(json.loads(proc.stdout), "schemaguard")
+    errors = [r for r in run["results"] if r["level"] == "error"]
+    assert errors and all(r["ruleId"] == "breaking-change"
+                          for r in errors)
+
+
+def test_validate_stdin_json_and_jsonl(tmp_path):
+    schema = tmp_path / "contract.json"
+    schema.write_text(json.dumps(CONTRACT_P2))
+    bad = subprocess.run(
+        [sys.executable, str(CLI), "validate", "-", "--schema",
+         str(schema), "--format", "json"],
+        input=json.dumps({"id": 7}), capture_output=True, text=True)
+    assert bad.returncode == 1
+    data = json.loads(bad.stdout)
+    assert data["results"][0]["source"] == "<stdin>"
+    good = subprocess.run(
+        [sys.executable, str(CLI), "validate", "-", "--schema",
+         str(schema), "--format", "json"],
+        input='{"id": "a"}\n{"id": "b"}\n',
+        capture_output=True, text=True)
+    assert good.returncode == 0
+    assert json.loads(good.stdout)["summary"]["total"] == 2
+
+
+def test_diff_stdin_one_side(tmp_path):
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"type": "object",
+                               "properties": {"a": {"type": "string"}}}))
+    proc = subprocess.run(
+        [sys.executable, str(CLI), "diff", str(old), "-",
+         "--format", "json"],
+        input=json.dumps({"type": "object", "properties": {}}),
+        capture_output=True, text=True)
+    assert proc.returncode == 1
+    assert json.loads(proc.stdout)["breaking_count"] >= 1
+    both = subprocess.run(
+        [sys.executable, str(CLI), "diff", "-", "-"],
+        input="{}", capture_output=True, text=True)
+    assert both.returncode == 2  # stdin can only be read once
