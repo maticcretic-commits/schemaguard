@@ -1,29 +1,50 @@
 # SchemaGuard 🛡️
 
-**Contracts are for agents too.**
+**Downstream systems consume agent outputs sight unseen — until one run renames `email` to `email_address`, invents a field nobody asked for, or quietly returns null for the field everything depends on. Nothing complains until the consumer breaks.**
 
-Downstream systems consume agent outputs sight unseen: a pipeline
-reads the JSON, a dashboard renders it, a webhook forwards it. Then
-one run renames `email` to `email_address`, invents a
-`confidence_score` nobody asked for, or quietly returns null for the
-field everything depends on — and nothing complains until the
-consumer breaks.
+SchemaGuard contract-checks saved agent outputs against a JSON Schema contract: per-file PASS/FAIL with the exact path of every violation. It can also infer a baseline schema from outputs you trust, and diff contract versions for breaking changes before a rename ships.
 
-SchemaGuard contract-checks saved agent outputs. Validate a batch
-against a JSON Schema contract and get per-file PASS/FAIL with the
-exact path of every violation. Infer a baseline schema from the
-outputs you trust, and diff contract versions for breaking changes
-before a rename ships.
-
-Offline and dependency-free: the validator is a pragmatic,
-honestly-documented subset of JSON Schema (below). Anything outside
-the subset is reported as an **UNSUPPORTED** keyword warning —
-never silently treated as passing.
+*Part of **AgentForge** — verify AI-agent work before you ship it.*
+*The family: [AgentProof](https://github.com/maticcretic-commits/agentproof) · [PromptRE](https://github.com/maticcretic-commits/promptre) · [AgentCI](https://github.com/maticcretic-commits/agentci) · [SecretScan](https://github.com/maticcretic-commits/secretscan) · [CostLedger](https://github.com/maticcretic-commits/costledger) · [SchemaGuard](https://github.com/maticcretic-commits/schemaguard) · [SkillAudit](https://github.com/maticcretic-commits/skillaudit) · [PromptDiff](https://github.com/maticcretic-commits/promptdiff) · [TraceTape](https://github.com/maticcretic-commits/tracetape) · [PromptLint](https://github.com/maticcretic-commits/promptlint) · [ClaimCheck](https://github.com/maticcretic-commits/claimcheck) · [TrustBadge](https://github.com/maticcretic-commits/trustbadge)*
 
 ```bash
-python src/schemaguard.py validate outputs/ --schema contract.json
-python src/schemaguard.py snapshot outputs/ --out baseline.schema.json
-python src/schemaguard.py diff contract.v1.json contract.v2.json
+$ schemaguard validate examples/outputs --schema examples/contract.json
+```
+
+```
+====================================================================
+SchemaGuard — validate report
+====================================================================
+Schema:  examples/contract.json
+Outputs: 3 · 2 passed · 1 failed · pass rate 66.7%
+
+✅ examples/outputs/clean.json — PASS
+✅ examples/outputs/hallucinated-field.json — PASS
+❌ examples/outputs/renamed-field.json — FAIL
+   $.user.email: missing required field
+
+❌ FAIL — 1 of 3 output(s) violate the contract
+```
+
+*Exit code 1 — one of three outputs violates the contract. (`hallucinated-field.json` passes here because this contract allows extra fields; `--strict` turns hallucinated fields into failures.)*
+
+## Install
+
+```bash
+pipx install git+https://github.com/maticcretic-commits/schemaguard
+# or, into the current environment:
+pip install git+https://github.com/maticcretic-commits/schemaguard
+```
+
+Then run it as `schemaguard …` (Python 3.9+, no dependencies — stdlib only).
+PyPI release planned; until then, the git URL above is the install path.
+
+From source — it is a single file, so no install is needed at all:
+
+```bash
+git clone https://github.com/maticcretic-commits/schemaguard
+cd schemaguard
+python src/schemaguard.py …
 ```
 
 ## The commands
@@ -175,10 +196,37 @@ the agent produced, snapshot what it *actually* produces, and never
 let a contract change ship without knowing whether it breaks the
 consumers you already have.
 
+## Limitations
+
+- The validator is a pragmatic, honestly-documented subset of JSON Schema
+  (listed below). Anything outside the subset is reported as an
+  UNSUPPORTED keyword warning — never silently treated as passing.
+- It validates shape, not sense: a well-typed but wrong value passes.
+- `snapshot` infers a contract from the outputs you feed it — feed it bad
+  outputs and it will faithfully enshrine them.
+
+## Exit codes & JSON output
+
+All AgentForge tools share one contract (full text in
+[CONVENTIONS.md](CONVENTIONS.md)):
+
+| Code | Meaning |
+|------|---------|
+| `0` | Clean / PASS — no findings at or above the tool's fail threshold |
+| `1` | Findings / FAIL — the tool ran fine; the answer is “no” |
+| `2` | Caller error — bad arguments, missing or unreadable input |
+| `3` | Environment error — the tool itself could not run |
+
+On a caller error the tool also prints one JSON line to stderr:
+`{"error": {"code": "file_not_found", "message": "no such file: x"}}`.
+
+JSON output (`--format json`) always carries the family envelope —
+`{"tool": "schemaguard", "version": "1.0.0", "schema_version": 1}` — alongside
+the tool's own payload keys, unchanged.
+
 ## Part of AgentForge
 
-SchemaGuard is the sixth tool in the [AgentForge](https://github.com/maticcretic-commits)
-trust layer for AI agents:
+SchemaGuard is one of the 12 tools in the [AgentForge](https://github.com/maticcretic-commits) family — offline, stdlib-only tools to **verify AI-agent work before you ship it**:
 
 - **AgentProof** — verify agent work — [github.com/maticcretic-commits/agentproof](https://github.com/maticcretic-commits/agentproof)
 - **PromptRE** — reverse-engineer agent prompts — [github.com/maticcretic-commits/promptre](https://github.com/maticcretic-commits/promptre)
